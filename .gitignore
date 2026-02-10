@@ -1,0 +1,22 @@
+# ========= SEGREDOS / CREDENCIAIS =========
+.env
+tokens.json
+
+# ========= PYTHON =========
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ========= AMBIENTE VIRTUAL =========
+venv/
+env/
+.venv/
+
+# ========= FLASK =========
+instance/
+*.log
+
+# ========= SISTEMA =========
+.DS_Store
+Thumbs.db
