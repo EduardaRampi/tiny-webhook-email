@@ -3,6 +3,7 @@ import json
 import time
 import requests
 import smtplib
+from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from flask import Flask, request, redirect
@@ -24,25 +25,66 @@ app = Flask(__name__)
 TOKEN_FILE = 'tokens.json'
 
 # ================= AUXILIARES =================
+def registrar_log(mensagem):
+    """Grava as ações e erros em um arquivo de texto para você ler depois."""
+    data_hora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"[{data_hora}] {mensagem}\n")
+        print(f"[{data_hora}] {mensagem}")
+    except Exception as e:
+        print(f"Erro ao escrever no log: {e}")
 
 def get_valid_token():
-    if not os.path.exists(TOKEN_FILE): return None
-    with open(TOKEN_FILE, 'r') as f: tokens = json.load(f)
-    
-    if time.time() > tokens['expires_at'] - 300:
-        payload = {'grant_type': 'refresh_token', 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET, 'refresh_token': tokens['refresh_token']}
-        resp = requests.post(TOKEN_URL, data=payload)
-        if resp.status_code == 200:
-            tokens = resp.json()
-            tokens['expires_at'] = time.time() + tokens.get('expires_in', 14400)
-            with open(TOKEN_FILE, 'w') as f: json.dump(tokens, f)
-            return tokens['access_token']
+    if not os.path.exists(TOKEN_FILE): 
+        registrar_log("❌ Alerta: Arquivo de tokens não existe. Login manual necessário.")
         return None
-    return tokens['access_token']
+    
+    try:
+        with open(TOKEN_FILE, 'r') as f: 
+            tokens = json.load(f)
+        
+        # 4 horas = 14400 segundos. Vamos renovar com 10 min de margem.
+        agora = time.time()
+        expira_em = tokens.get('expires_at', 0)
+
+        if agora > expira_em - 600:
+            registrar_log("🔄 Token expirado ou próximo de expirar. Iniciando Refresh...")
+            
+            payload = {
+                'grant_type': 'refresh_token',
+                'client_id': CLIENT_ID,
+                'client_secret': CLIENT_SECRET,
+                'refresh_token': tokens.get('refresh_token')
+            }
+            
+            # A documentação pede Content-Type: application/x-www-form-urlencoded
+            # O 'data=' do requests já envia nesse formato automaticamente.
+            resp = requests.post(TOKEN_URL, data=payload)
+            
+            if resp.status_code == 200:
+                novos_dados = resp.json()
+                # Importante: O Tiny envia um NOVO refresh_token a cada renovação
+                novos_dados['expires_at'] = time.time() + novos_dados.get('expires_in', 14400)
+                
+                with open(TOKEN_FILE, 'w') as f:
+                    json.dump(novos_dados, f)
+                
+                registrar_log("✅ Token renovado com sucesso via Refresh Token.")
+                return novos_dados['access_token']
+            else:
+                registrar_log(f"⚠️ Erro no Refresh: {resp.status_code} - {resp.text}")
+                # Se der erro aqui, o refresh_token de 1 dia provavelmente expirou.
+                return None
+                
+        return tokens.get('access_token')
+    except Exception as e:
+        registrar_log(f"❌ Erro na leitura do token: {str(e)}")
+        return None
 
 def enviar_email(email_destino, assunto, html_corpo):
     msg = MIMEMultipart()
-    msg['From'] = f"Empresa XXXX <{GMAIL_REMETENTE}>"
+    msg['From'] = f"Odinei Peças <{GMAIL_REMETENTE}>"
     msg['To'] = email_destino
     msg['Subject'] = assunto
     msg.attach(MIMEText(html_corpo, 'html'))
@@ -52,49 +94,74 @@ def enviar_email(email_destino, assunto, html_corpo):
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
             server.login(GMAIL_REMETENTE, GMAIL_SENHA)
             server.sendmail(GMAIL_REMETENTE, email_destino, msg.as_string())
-        print(f"✅ E-mail enviado com sucesso para {email_destino}!")
+        registrar_log(f"✅ E-mail enviado com sucesso para {email_destino}!")
     except Exception as e:
-        print(f"❌ Erro no envio de e-mail: {e}")
+        registrar_log(f"❌ Erro no envio de e-mail: {e}")
 
 # ================= LÓGICA DE NEGÓCIO =================
 
 def processar_webhook(tipo, dados_tiny):
     token = get_valid_token()
     if not token: 
-        print("❌ ERRO: Token inválido. Acesse /login novamente.")
+        registrar_log("❌ ERRO: Token inválido. Acesse /login novamente.")
         return
     
     headers = {'Authorization': f'Bearer {token}'}
-    print(f"🔍 Processando {tipo}...")
+    registrar_log(f"🔍 Processando {tipo}...")
 
-    # LÓGICA PARA NOTA FISCAL
+    # ================= LOGICA: NOTA FISCAL =================
     if tipo == 'nota_fiscal':
         id_nota = dados_tiny.get('idNotaFiscalTiny')
-        print(f"📄 Processando Nota Fiscal ID: {id_nota}")
+        numero_nf = dados_tiny.get('numero', 'S/N')
+        link_danfe = dados_tiny.get('urlDanfe', '#')
         
-        # A URL da API para notas é diferente
+        registrar_log(f"📄 Processando Nota Fiscal nº {numero_nf} (ID: {id_nota})")
+        
+        # Faz a chamada para a API
         res = requests.get(f"{API_BASE_URL}/notas/{id_nota}", headers=headers)
         
         if res.status_code == 200:
-            info = res.json().get('data', {})
-            email = info.get('cliente', {}).get('email')
-            # Para notas, o link do PDF é importante
-            link_danfe = dados_tiny.get('urlDanfe') 
+            # Correção: A resposta da API já é o objeto da nota, sem chave 'data'
+            info = res.json()  # Remove .get('data', {})
             
-            if email:
-                corpo = f"<h2>Sua Nota Fiscal foi emitida!</h2><p>Pode baixar o PDF aqui: {link_danfe}</p>"
-                enviar_email(email, "Nota Fiscal Emitida - Odinei Peças", corpo)
+            cliente = info.get('cliente', {})
+            email = cliente.get('email')
+            nome = cliente.get('nome', 'Cliente')
+
+            # Verificação adicional: Garantir que email não seja vazio, None ou "string" (valor padrão)
+            if email and email.strip() and email != "string":
+                registrar_log(f"📧 Enviando nota {numero_nf} para {email}...")
+                corpo_nf = f"""
+                <div style="font-family:sans-serif; max-width:600px; margin:auto; border:1px solid #eee; padding:20px;">
+                    <h2 style="color:#2e7d32;">Sua Nota Fiscal chegou!</h2>
+                    <p>Olá <b>{nome}</b>,</p>
+                    <p>A nota fiscal da sua compra na <b>Odinei Peças</b> já está disponível.</p>
+                    <div style="text-align:center; margin:30px 0;">
+                        <a href="{link_danfe}" style="background-color:#2e7d32; color:white; padding:15px 25px; text-decoration:none; border-radius:5px; font-weight:bold;">VISUALIZAR NOTA FISCAL (PDF)</a>
+                    </div>
+                    <p><b>Número da Nota:</b> {numero_nf}</p>
+                    <p style="font-size:12px; color:#777;">Obrigado pela preferência!</p>
+                </div>
+                """
+                enviar_email(email, f"Nota Fiscal Emitida - Odinei Peças (NF {numero_nf})", corpo_nf)
+            else:
+                registrar_log(f"⚠️ Nota encontrada, mas o e-mail do cliente está vazio, inválido ou é o valor padrão ('string'). Email: {email}")
+        
+        elif res.status_code == 401:
+            registrar_log("❌ ERRO 401: Seu token não tem permissão para acessar NOTAS FISCAIS. Verifique as permissões do aplicativo no Tiny.")
+        else:
+            registrar_log(f"❌ Erro na API de Notas: {res.status_code}")
 
     # LÓGICA PARA PEDIDO 
     elif tipo in ['venda', 'pedido_venda', 'inclusao_pedido']:
         id_pedido = dados_tiny.get('id')
-        print(f"🛒 Buscando Pedido ID: {id_pedido}")
+        registrar_log(f"🛒 Buscando Pedido ID: {id_pedido}")
         
         res = requests.get(f"{API_BASE_URL}/pedidos/{id_pedido}", headers=headers)
         
         if res.status_code == 200:
             resposta_completa = res.json()
-            print(f"DEBUG API: {resposta_completa}") 
+            registrar_log(f"DEBUG API: {resposta_completa}") 
 
             info = resposta_completa.get('data', {})
             
@@ -135,13 +202,19 @@ def processar_webhook(tipo, dados_tiny):
                     for i in itens:
                         # Na tua estrutura: i['produto']['descricao']
                         prod = i.get('produto', {})
+                        codigo = prod.get('sku', '')
                         desc = prod.get('descricao', 'Produto')
                         qtd = i.get('quantidade', 0)
                         preco = i.get('valorUnitario', 0)
+
+                        if codigo:
+                            texto_produto = f"<span style='color:#555; font-size:12px; font-weight:bold;'>{codigo}</span><br>{desc}"
+                        else:
+                            texto_produto = desc
                         
                         linhas_itens += f"""
                             <tr>
-                                <td style="padding: 8px; border-bottom: 1px solid #ddd;">{desc}</td>
+                                <td style="padding: 8px; border-bottom: 1px solid #ddd;">{texto_produto}</td>
                                 <td style="padding: 8px; border-bottom: 1px solid #ddd; text-align: center;">{qtd}</td>
                                 <td style="padding: 8px; border-bottom: 1px solid #ddd; text-align: right;">R$ {preco:.2f}</td>
                             </tr>
@@ -194,11 +267,11 @@ def processar_webhook(tipo, dados_tiny):
                     
                     enviar_email(email, f"Pedido Confirmado #{numero} - Odinei Peças", corpo_html)
                 else:
-                    print("⚠️ E-mail não encontrado no cadastro do cliente.")
+                    registrar_log("⚠️ E-mail não encontrado no cadastro do cliente.")
             else:
-                print("❌ Estrutura do cliente inválida no JSON do Tiny.")
+                registrar_log("❌ Estrutura do cliente inválida no JSON do Tiny.")
         else:
-            print(f"❌ Erro na API Tiny ({res.status_code}): {res.text}")
+            registrar_log(f"❌ Erro na API Tiny ({res.status_code}): {res.text}")
 
 # ================= ROTAS =================
 
@@ -266,5 +339,4 @@ def salvar_tokens(t):
     with open(TOKEN_FILE, 'w') as f: json.dump(t, f)
 
 if __name__ == '__main__':
-    # Rode o servidor
-    app.run(debug=True, port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=False)
